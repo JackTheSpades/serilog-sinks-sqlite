@@ -31,11 +31,10 @@ namespace Serilog.Sinks.SQLite
     internal class SQLiteSink : BatchProvider, ILogEventSink
     {
         private readonly string _databasePath;
-        private readonly IFormatProvider _formatProvider;
-        private readonly bool _storeTimestampInUtc;
         private readonly uint _maxDatabaseSize;
         private readonly bool _rollOver;
         private readonly string _tableName;
+        private readonly SQLiteColumnCollection _columns;
         private readonly TimeSpan? _retentionPeriod;
         private readonly Timer _retentionTimer;
         private const string TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fff";
@@ -48,26 +47,29 @@ namespace Serilog.Sinks.SQLite
         public SQLiteSink(
             string sqlLiteDbPath,
             string tableName,
-            IFormatProvider formatProvider,
-            bool storeTimestampInUtc,
             TimeSpan? retentionPeriod,
             TimeSpan? retentionCheckInterval,
+            SQLiteColumnCollection columns,
             uint batchSize = 100,
             uint maxDatabaseSize = 10,
             bool rollOver = true) : base(batchSize: (int)batchSize, maxBufferSize: 100_000)
         {
             _databasePath = sqlLiteDbPath;
             _tableName = tableName;
-            _formatProvider = formatProvider;
-            _storeTimestampInUtc = storeTimestampInUtc;
             _maxDatabaseSize = maxDatabaseSize;
             _rollOver = rollOver;
+
+            _columns = columns ?? throw new ArgumentNullException(nameof(columns));
+
+            if (retentionPeriod.HasValue && !columns.HasTimestampColumn)
+                throw new ArgumentException($"Usage of retention requires that columns has a {nameof(TimestampSQLiteColumn)} column.");
 
             if (maxDatabaseSize > MaxSupportedDatabaseSize)
             {
                 throw new SQLiteException($"Database size greater than {MaxSupportedDatabaseSize} MB is not supported");
             }
 
+            _columns.Lock();
             InitializeDatabase();
 
             if (retentionPeriod.HasValue)
@@ -130,34 +132,20 @@ namespace Serilog.Sinks.SQLite
 
         private void CreateSqlTable(SQLiteConnection sqlConnection)
         {
-            var colDefs = "id INTEGER PRIMARY KEY AUTOINCREMENT,";
-            colDefs += "Timestamp TEXT,";
-            colDefs += "Level VARCHAR(10),";
-            colDefs += "Exception TEXT,";
-            colDefs += "RenderedMessage TEXT,";
-            colDefs += "Properties TEXT";
-
-            var sqlCreateText = $"CREATE TABLE IF NOT EXISTS {_tableName} ({colDefs})";
-
+            var sqlCreateText = $"CREATE TABLE IF NOT EXISTS {_tableName} ({_columns.IdColumnName} INTEGER PRIMARY KEY AUTOINCREMENT, {string.Join(",", _columns.Select(c => c.Create()))})";
             var sqlCommand = new SQLiteCommand(sqlCreateText, sqlConnection);
             sqlCommand.ExecuteNonQuery();
         }
 
         private SQLiteCommand CreateSqlInsertCommand(SQLiteConnection connection)
         {
-            var sqlInsertText = "INSERT INTO {0} (Timestamp, Level, Exception, RenderedMessage, Properties)";
-            sqlInsertText += " VALUES (@timeStamp, @level, @exception, @renderedMessage, @properties)";
-            sqlInsertText = string.Format(sqlInsertText, _tableName);
-
+            var sqlInsertText = $"INSERT INTO {_tableName} ({string.Join(",", _columns.Select(c => c.Name))}) VALUES ({string.Join(",", _columns.Select(c => c.Parameter))})";
             var sqlCommand = connection.CreateCommand();
             sqlCommand.CommandText = sqlInsertText;
             sqlCommand.CommandType = CommandType.Text;
 
-            sqlCommand.Parameters.Add(new SQLiteParameter("@timeStamp", DbType.DateTime2));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@level", DbType.String));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@exception", DbType.String));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@renderedMessage", DbType.String));
-            sqlCommand.Parameters.Add(new SQLiteParameter("@properties", DbType.String));
+            foreach (SQLiteColumn col in _columns)
+                sqlCommand.Parameters.Add(new SQLiteParameter(col.Parameter, col.DbType));
 
             return sqlCommand;
         }
@@ -195,12 +183,11 @@ namespace Serilog.Sinks.SQLite
         private SQLiteCommand CreateSqlDeleteCommand(SQLiteConnection sqlConnection, DateTimeOffset epoch)
         {
             var cmd = sqlConnection.CreateCommand();
-            cmd.CommandText = $"DELETE FROM {_tableName} WHERE Timestamp < @epoch";
+            cmd.CommandText = $"DELETE FROM {_tableName} WHERE {_columns.TimeStampColumn.Name} < @epoch";
             cmd.Parameters.Add(
-                new SQLiteParameter("@epoch", DbType.DateTime2)
+                new SQLiteParameter("@epoch", _columns.TimeStampColumn.DbType)
                 {
-                    Value = (_storeTimestampInUtc ? epoch.ToUniversalTime() : epoch).ToString(
-                        TimestampFormat)
+                    Value = _columns.TimeStampColumn.Convert(epoch)
                 });
 
             return cmd;
@@ -270,17 +257,8 @@ namespace Serilog.Sinks.SQLite
 
                     foreach (var logEvent in logEventsBatch)
                     {
-                        sqlCommand.Parameters["@timeStamp"].Value = _storeTimestampInUtc
-                            ? logEvent.Timestamp.ToUniversalTime().ToString(TimestampFormat)
-                            : logEvent.Timestamp.ToString(TimestampFormat);
-                        sqlCommand.Parameters["@level"].Value = logEvent.Level.ToString();
-                        sqlCommand.Parameters["@exception"].Value =
-                            logEvent.Exception?.ToString() ?? string.Empty;
-                        sqlCommand.Parameters["@renderedMessage"].Value = logEvent.MessageTemplate.Render(logEvent.Properties, _formatProvider);
-
-                        sqlCommand.Parameters["@properties"].Value = logEvent.Properties.Count > 0
-                            ? logEvent.Properties.Json()
-                            : string.Empty;
+                        foreach (var col in _columns)
+                            sqlCommand.Parameters[col.Parameter].Value = col.ValueGetter(logEvent);
 
                         await sqlCommand.ExecuteNonQueryAsync().ConfigureAwait(false);
                     }
